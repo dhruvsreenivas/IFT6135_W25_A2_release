@@ -128,17 +128,16 @@ class MultiHeadedAttention(nn.Module):
         # ==========================
 
         seq_len, head_size = queries.size(-2), queries.size(-1)
-        permuted_keys = keys.permute(0, 1, 3, 2)
 
         # [batch_size, num_heads, seq_len, seq_len]
-        attn_weights = queries @ permuted_keys / math.sqrt(head_size)
+        attn_weights = (queries @ keys.transpose(-2, -1)) * (1.0 / math.sqrt(head_size))
 
         # now we need to mask this to handle causality
         # this means that future tokens get masked with -inf to become 0 when softmaxing
         attn_mask = torch.tril(
             torch.ones(seq_len, seq_len, dtype=queries.dtype, device=queries.device)
         ).view(1, 1, seq_len, seq_len)
-        attn_weights = torch.masked_fill(attn_weights, attn_mask, -torch.inf)
+        attn_weights = torch.masked_fill(attn_weights, attn_mask == 0, -torch.inf)
 
         # now we softmax over the last sequence dim
         attn_weights = F.softmax(attn_weights, dim=-1)
@@ -561,11 +560,20 @@ class GPTEmbedding(nn.Module):
         # TODO: Write your code here
         # ==========================
 
+        bs, seq_len = tokens.size()
+
         # first embed the inputs -> [batch_size, seq_len, embedding_dim]
         token_embs = self.tokens(tokens)
 
-        # now add the positional encodings
-        pos_embs = self.position_encoding.unsqueeze(0)
+        # now grab the positional embeds for the token positions
+        positions = torch.arange(seq_len, device=tokens.device).unsqueeze(0).tile(bs, 1)
+        positions = torch.flatten(positions)
+
+        # [bs * seq_len, embedding_size] -> [bs, seq_len, embedding_size]
+        pos_embs = torch.index_select(self.position_encoding, 0, positions).view(
+            bs, seq_len, -1
+        )
+
         return token_embs + pos_embs
 
 

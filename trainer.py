@@ -82,11 +82,11 @@ def get_loss_and_accuracy(logits, targets, eq_positions, mask, reduction="mean")
 
     # compute accuracy -> # [bs, seq]
     argmax_indices = torch.argmax(logits, -1)
-    unreduced_accuracy = argmax_indices == targets
+    unreduced_accuracy = (argmax_indices == targets).float()
 
     # now we take the mask, but in reverse -- if we're masked, the output is 1 by definition
     # [bs, seq] -> take prod across seq dim = [bs]
-    unreduced_accuracy = torch.where(rhs_mask, 1.0, unreduced_accuracy).to(
+    unreduced_accuracy = torch.where(rhs_mask == 0.0, 1.0, unreduced_accuracy).to(
         dtype=unreduced_accuracy.dtype
     )
     unreduced_accuracy = unreduced_accuracy.prod(-1)
