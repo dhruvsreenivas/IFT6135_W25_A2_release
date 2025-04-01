@@ -526,7 +526,7 @@ class GPTEmbedding(nn.Module):
         pos_embs = torch.empty(n_positions, dimension)
 
         # t shape: [n_positions, 1]
-        t = torch.arange(0, n_positions, dtype=np.float32)[:, None]
+        t = torch.arange(0, n_positions, dtype=torch.float32)[:, None]
 
         # exp term shape: [dimension // 2]
         exp_term = torch.exp(
