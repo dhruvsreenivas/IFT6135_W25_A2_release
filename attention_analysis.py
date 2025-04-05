@@ -1,29 +1,20 @@
-"""
-# Usage
-# python run_exp.py --p 31 --operator + --r_train 0.6 --train_batch_size 2**12 --eval_batch_size 2**12 --model gpt --optimizer adamw --lr 1e-3 --momentum 0.9 --weight_decay 1e-1 --n_steps 10**4 * 2 --device cuda --exp_id 0 --exp_name debug --log_dir ../logs --seed 42 --verbose
-"""
-
 import argparse
+import os
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
+from matplotlib import cm
+from torch.utils.data import DataLoader
 
-from train import train, train_m_models
+from data import get_arithmetic_dataset
+from gpt import GPT
+from run_exp import bool_flag
 
-
-def bool_flag(s):
-    """
-    Parse boolean arguments from the command line.
-    """
-    if s.lower() in {"off", "false", "0"}:
-        return False
-    elif s.lower() in {"on", "true", "1"}:
-        return True
-    else:
-        raise argparse.ArgumentTypeError("Invalid value for a boolean flag!")
+DEFAULT_PATH = "/network/scratch/d/dhruv.sreenivas/ift-6135/hw2/logs/gpt/default/0"
 
 
-if __name__ == "__main__":
-
+def get_args():
     parser = argparse.ArgumentParser(description="Run an experiment for assignment 2.")
 
     # Data
@@ -239,13 +230,115 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    return args
 
-    if args.multiple:
-        all_models, all_metrics, checkpoint_path = train_m_models(
-            args, M=2, seeds=[0, 42]
+
+def plot_attention_weights(args):
+    """Plots attention weights of the transformer for a given set of 2 datapoints."""
+
+    # load in dataset
+    (train_dataset, _), tokenizer, MAX_LENGTH, padding_index = get_arithmetic_dataset(
+        args.p,
+        args.p,
+        args.operator,
+        args.r_train,
+        args.operation_orders,
+        is_symmetric=False,
+        shuffle=True,
+        seed=args.seed,
+    )
+    vocabulary_size = len(tokenizer)
+
+    # initialize model first
+    model = GPT(
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        embedding_size=args.embedding_size,
+        vocabulary_size=vocabulary_size,
+        sequence_length=MAX_LENGTH,
+        multiplier=4,
+        dropout=args.dropout,
+        non_linearity="gelu",
+        padding_index=padding_index,
+        bias_attention=True,
+        bias_classifier=args.bias_classifier,
+        share_embeddings=args.share_embeddings,
+    )
+
+    # load in model weights
+    path = os.path.join(
+        DEFAULT_PATH,
+        "default_state_10002_acc=0.9625779986381531_loss=0.07061094790697098.pth",
+    )
+    state_dicts = torch.load(path, map_location="cpu")
+
+    model.load_state_dict(state_dicts["model_state_dict"])
+    model.eval()
+
+    # now grab the first batch of data
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=2,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+
+    # we grab the attention heads for the first batch
+    batch = next(iter(train_dataloader))
+    batch_x = batch[0]  # [2, seq_len]
+
+    # now we decode to get the actual tokens
+    batch_tokens = [tokenizer.decode(dp) for dp in batch_x]
+    torch.save(batch_tokens, "tokens.pt")
+
+    _, (_, attn_weights) = model(
+        batch_x
+    )  # [2, num_layers, num_heads, seq_len, seq_len]
+    torch.save(attn_weights, "attn_weights.pt")
+
+    for b in range(2):
+        # create figure for this particular datapoint
+        rows, cols = args.num_layers, args.num_heads
+        figsize = (6, 4)
+        fig = plt.figure(figsize=(cols * figsize[0], rows * figsize[1]))
+
+        source = batch_tokens[b].split(" ")
+
+        num = 1
+        for i in range(args.num_layers):
+            for j in range(args.num_heads):
+                ax = fig.add_subplot(rows, cols, num)
+                # get the heads for this particular batch.
+                layer_head_attn_weights = (
+                    attn_weights[b, i, j, :, :].cpu().numpy()
+                )  # [seq_len, seq_len]
+                assert layer_head_attn_weights.shape == (6, 6)
+
+                plt.imshow(layer_head_attn_weights)
+                plt.title(f"Layer {i}, Head {j}")
+                plt.ylabel("x")
+                plt.xlabel("x (context)")
+                plt.colorbar()
+
+                ax.set_xticks(np.arange(len(source)), labels=source)
+                ax.set_yticks(np.arange(len(source)), labels=source)
+
+                num += 1
+
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(
+                "/network/scratch/d/dhruv.sreenivas/ift-6135/hw2/logs/gpt/default",
+                f"q8p1_batch_{b}.pdf",
+            ),
+            dpi=300,
+            bbox_inches="tight",
+            format="pdf",
         )
-    else:
-        all_metrics, checkpoint_path = train(args)
+        plt.clf()
 
-    print("==" * 60)
-    print("Experiment finished.")
+
+if __name__ == "__main__":
+    args = get_args()
+
+    plot_attention_weights(args)

@@ -1,0 +1,2 @@
+python run_exp.py --p 11 --operator + --r_train 0.5 --model lstm --optimizer adamw --log_dir /network/scratch/d/dhruv.sreenivas/ift-6135/hw2/logs/lstm/scale_data_q4/ --exp_name op_orders --multiple --q4_modified
+python run_exp.py --p 11 --operator + --r_train 0.5 --model gpt --optimizer adamw --log_dir /network/scratch/d/dhruv.sreenivas/ift-6135/hw2/logs/gpt/scale_data_q4/ --exp_name op_orders --multiple --q4_modified

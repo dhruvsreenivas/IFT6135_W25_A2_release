@@ -54,7 +54,7 @@ def get_loss_and_accuracy(logits, targets, eq_positions, mask, reduction="mean")
     # TODO: Write your code here
     # ==========================
 
-    bs, seq_len = targets.size()
+    seq_len = targets.size(1)
 
     # first get log P from Y -> [bs, seq, vocab_size]
     log_probs = F.log_softmax(logits, dim=-1)
@@ -63,16 +63,18 @@ def get_loss_and_accuracy(logits, targets, eq_positions, mask, reduction="mean")
     target_log_probs = torch.gather(log_probs, -1, targets.unsqueeze(-1)).squeeze(-1)
 
     # now we need to get the `relevant` target log probs -- between = and pad
-    # basically need to set an `eq_mask` that is zero whenever the token is before the eq_positions
-    eq_mask = torch.arange(seq_len).unsqueeze(0).tile(bs, 1)
-    eq_positions = eq_positions.unsqueeze(1).tile(1, seq_len)
-    eq_mask = torch.where(eq_mask < eq_positions, 0.0, 1.0).to(dtype=mask.dtype)
+    # basically need to set an `eq_mask` that is zero whenever the token is before the eq_positions and 1 otherwise
+    eq_mask = (
+        1 - (torch.arange(seq_len).unsqueeze(0) <= eq_positions.unsqueeze(1)).long()
+    )
 
     # now we take an AND between `eq_mask` and `mask`
-    rhs_mask = eq_mask * mask
+    rhs_mask = (mask * eq_mask).to(target_log_probs.device)
 
-    # finally compute masked loss
-    unreduced_loss = (target_log_probs * rhs_mask).sum(-1)
+    # finally compute masked loss -> unreduced loss is of shape [bs]
+    unreduced_loss = -(target_log_probs * rhs_mask.float()).sum(
+        -1
+    ) / rhs_mask.float().sum(-1)
     if reduction == "none":
         loss = unreduced_loss
     elif reduction == "mean":
@@ -84,12 +86,11 @@ def get_loss_and_accuracy(logits, targets, eq_positions, mask, reduction="mean")
     argmax_indices = torch.argmax(logits, -1)
     unreduced_accuracy = (argmax_indices == targets).float()
 
-    # now we take the mask, but in reverse -- if we're masked, the output is 1 by definition
-    # [bs, seq] -> take prod across seq dim = [bs]
-    unreduced_accuracy = torch.where(rhs_mask == 0.0, 1.0, unreduced_accuracy).to(
-        dtype=unreduced_accuracy.dtype
-    )
-    unreduced_accuracy = unreduced_accuracy.prod(-1)
+    # now, we're fully right if we're equal to the mask sum -- basically whenever we're valid, we should have a 1
+    unreduced_accuracy = (unreduced_accuracy * rhs_mask.float()).sum(
+        -1
+    ) == rhs_mask.float().sum(-1)
+    unreduced_accuracy = unreduced_accuracy.float()
 
     if reduction == "none":
         accuracy = unreduced_accuracy
@@ -106,11 +107,21 @@ def get_loss_and_accuracy(logits, targets, eq_positions, mask, reduction="mean")
 
 
 @torch.no_grad()
-def eval_model(model, loader, device):
+def eval_model(model, loader, device, q4=False):
     model.eval()
     acc = 0
     loss = 0
     n = 0
+
+    if q4:
+        binary_loss = 0
+        binary_acc = 0
+        ternary_loss = 0
+        ternary_acc = 0
+
+        binary_n = 0
+        ternary_n = 0
+
     for batch in loader:
         batch_x, batch_y, eq_positions, mask = batch  # (B, S), (B, S), (B,), (B, S)
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -119,14 +130,71 @@ def eval_model(model, loader, device):
             logits, batch_y, eq_positions, mask
         )
         n += batch_x.shape[0]
-        loss += batch_loss.item() * batch_x.shape[0]
-        acc += batch_acc * batch_x.shape[0]
+        loss += batch_loss.cpu().item() * batch_x.shape[0]
+        acc += batch_acc.cpu() * batch_x.shape[0]
+
+        # add loss/acc for binary/ternary ops if required
+        # hacky but minimal change to the original code
+        if q4:
+            unreduced_batch_loss, unreduced_batch_acc = get_loss_and_accuracy(
+                logits, batch_y, eq_positions, mask, reduction="none"
+            )  # [bs]
+            binary_mask = (eq_positions == 3).to(batch_x.device).float()
+            ternary_mask = (eq_positions == 5).to(batch_x.device).float()
+
+            binary_batch_loss = (unreduced_batch_loss * binary_mask).sum()
+            ternary_batch_loss = (unreduced_batch_loss * ternary_mask).sum()
+
+            binary_batch_acc = (unreduced_batch_acc * binary_mask).sum()
+            ternary_batch_acc = (unreduced_batch_acc * ternary_mask).sum()
+
+            binary_batch_n = binary_mask.sum()
+            ternary_batch_n = ternary_mask.sum()
+
+            # now add to global stuff
+            binary_loss += binary_batch_loss.cpu().item()
+            ternary_loss += ternary_batch_loss.cpu().item()
+            binary_acc += binary_batch_acc.cpu().item()
+            ternary_acc += ternary_batch_acc.cpu().item()
+            binary_n += binary_batch_n.cpu().item()
+            ternary_n += ternary_batch_n.cpu().item()
 
     ##########
     # You can add more metrics in the dictionary (e.g., l2 norm of the parameters, etc.)
     ##########
 
-    return {"loss": loss / n, "accuracy": acc / n}
+    param_l2_norm = 0.0
+    for p in model.parameters():
+        if p.requires_grad:
+            param_l2_norm += (p**2).sum()
+
+    param_l2_norm = torch.sqrt(param_l2_norm)
+
+    ##############
+    # grab the number of parameters of the model
+    num_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    num_embedding_params = sum(
+        p.numel() for p in model.embedding.parameters() if p.requires_grad
+    )
+    num_params = num_total_params - num_embedding_params
+
+    logs = {
+        "loss": loss / n,
+        "accuracy": acc / n,
+        "num-params": num_params,
+        "l2-norm": param_l2_norm,
+    }
+    if q4:
+        logs.update(
+            {
+                "binary-loss": binary_loss / binary_n,
+                "binary-accuracy": binary_acc / binary_n,
+                "ternary-loss": ternary_loss / ternary_n,
+                "ternary-accuracy": ternary_acc / ternary_n,
+            }
+        )
+
+    return logs
 
 
 ########################################################################################
@@ -150,6 +218,7 @@ def train(
     save_model_step: int = 1,
     save_statistic_step: int = 1,
     verbose=True,
+    q4=False,
 ):
     """
     model (nn.Module) : The model to train
@@ -190,11 +259,11 @@ def train(
 
     ##############
 
-    train_statistics = eval_model(model, train_loader_for_eval, device)
+    train_statistics = eval_model(model, train_loader_for_eval, device, q4=q4)
     for k, v in train_statistics.items():
         all_metrics["train"][k].append(v)
 
-    test_statistics = eval_model(model, test_loader, device)
+    test_statistics = eval_model(model, test_loader, device, q4=q4)
     for k, v in test_statistics.items():
         all_metrics["test"][k].append(v)
 
@@ -252,8 +321,8 @@ def train(
             # TODO: Write your code here
             # ==========================
 
-            scheduler.step()
-            current_lr = scheduler.optimizer.param_groups[0]["lr"]
+            # scheduler.step()
+            # current_lr = scheduler.optimizer.param_groups[0]["lr"]
 
             # ==========================
             # ==========================
@@ -263,11 +332,13 @@ def train(
                 or cur_step % eval_period == 0
                 or cur_step <= eval_first
             ):
-                train_statistics = eval_model(model, train_loader_for_eval, device)
+                train_statistics = eval_model(
+                    model, train_loader_for_eval, device, q4=q4
+                )
                 for k, v in train_statistics.items():
                     all_metrics["train"][k].append(v)
 
-                test_statistics = eval_model(model, test_loader, device)
+                test_statistics = eval_model(model, test_loader, device, q4=q4)
                 for k, v in test_statistics.items():
                     all_metrics["test"][k].append(v)
 
@@ -312,8 +383,8 @@ def train(
         # TODO: Write your code here
         # ==========================
 
-        scheduler.step()
-        current_lr = scheduler.optimizer.param_groups[0]["lr"]
+        # scheduler.step()
+        # current_lr = scheduler.optimizer.param_groups[0]["lr"]
 
         # ==========================
         # ==========================
@@ -325,7 +396,8 @@ def train(
 
         end_time = time.time()
         elapsed_time = end_time - start_time
-        print(f"Elapsed time for one step : {elapsed_time} seconds")
+        if verbose:
+            print(f"Elapsed time for one step : {elapsed_time} seconds")
 
     state = {
         "model_state_dict": model.state_dict(),
@@ -336,11 +408,11 @@ def train(
         f"{checkpoint_path}/{exp_name}_state_{cur_step}_acc={test_statistics['accuracy']}_loss={test_statistics['loss']}.pth",
     )
 
-    train_statistics = eval_model(model, train_loader_for_eval, device)
+    train_statistics = eval_model(model, train_loader_for_eval, device, q4=q4)
     for k, v in train_statistics.items():
         all_metrics["train"][k].append(v)
 
-    test_statistics = eval_model(model, test_loader, device)
+    test_statistics = eval_model(model, test_loader, device, q4=q4)
     for k, v in test_statistics.items():
         all_metrics["test"][k].append(v)
 

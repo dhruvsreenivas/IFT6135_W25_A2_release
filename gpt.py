@@ -209,7 +209,7 @@ class MultiHeadedAttention(nn.Module):
         attended_values = attn_weights @ values
 
         # [batch_size, seq_len, num_heads * head_size]
-        outputs = attended_values.permute(0, 2, 1, 3).flatten(-2, -1)
+        outputs = self.merge_heads(attended_values)
 
         return outputs, attn_weights
 
